@@ -56,7 +56,7 @@ namespace Oxide.Plugins
         }
 
         // Runtime Logic
-        private MatchRules _currentRules;
+        private MatchRules _currentRules = GetPresetRules(Preset5v5);
         private ArenaProfile _activeArena = null;
         private readonly Dictionary<string, MatchSession> _sessions = new Dictionary<string, MatchSession>();
         private readonly Dictionary<ulong, MatchSession> _playerSessions = new Dictionary<ulong, MatchSession>();
@@ -78,6 +78,9 @@ namespace Oxide.Plugins
         private const string LayerUI = "UI_Paintball_HUD";
         private const string LayerMenu = "UI_Paintball_Menu";
         private const string LayerJoin = "UI_Paintball_Join";
+        private const string Preset5v5 = "5v5";
+        private const string Preset1v1 = "1v1";
+        private const string Preset2v2 = "2v2";
         private const string SpherePrefab = "assets/prefabs/visualization/sphere.prefab";
 
         #endregion
@@ -104,6 +107,7 @@ namespace Oxide.Plugins
 
         private class MatchRules
         {
+            // PresetKey should be one of the preset constants (5v5, 1v1, 2v2).
             public string PresetKey;
             public string PresetName;
             public GameMode Mode = GameMode.TeamDeathmatch;
@@ -217,22 +221,28 @@ namespace Oxide.Plugins
 
         private string GetSessionKey(string arenaName, string presetKey) => $"{arenaName}:{presetKey}";
 
-        private MatchRules GetPresetRules(string presetKey)
+        private static readonly Dictionary<string, MatchRules> PresetRuleTemplates = new Dictionary<string, MatchRules>
         {
-            switch (presetKey?.ToLower())
+            [Preset5v5] = new MatchRules { PresetKey = Preset5v5, PresetName = "5v5 TDM", Mode = GameMode.TeamDeathmatch, ScoreLimit = 10, TeamSize = 5, Respawn = true },
+            [Preset1v1] = new MatchRules { PresetKey = Preset1v1, PresetName = "1v1 Duel", Mode = GameMode.TeamDeathmatch, ScoreLimit = 3, TeamSize = 1, Respawn = true },
+            [Preset2v2] = new MatchRules { PresetKey = Preset2v2, PresetName = "2v2 Elim", Mode = GameMode.Elimination, ScoreLimit = 0, TeamSize = 2, Respawn = false }
+        };
+
+        private static MatchRules GetPresetRules(string presetKey)
+        {
+            presetKey = presetKey?.ToLower();
+            if (string.IsNullOrEmpty(presetKey) || !PresetRuleTemplates.TryGetValue(presetKey, out var rules))
             {
-                case "1v1":
-                    return new MatchRules { PresetKey = "1v1", PresetName = "1v1 Duel", Mode = GameMode.TeamDeathmatch, ScoreLimit = 3, TeamSize = 1 };
-                case "2v2":
-                    return new MatchRules { PresetKey = "2v2", PresetName = "2v2 Elim", Mode = GameMode.Elimination, ScoreLimit = 0, TeamSize = 2, Respawn = false };
-                default:
-                    return new MatchRules { PresetKey = "5v5", PresetName = "5v5 TDM", Mode = GameMode.TeamDeathmatch, ScoreLimit = 10, TeamSize = 5 };
+                return PresetRuleTemplates[Preset5v5];
             }
+            return rules;
         }
 
         private MatchSession GetOrCreateSession(string arenaName, string presetKey)
         {
-            if (string.IsNullOrEmpty(arenaName) || string.IsNullOrEmpty(presetKey) || _data?.Arenas == null || _data.Arenas.Count == 0) return null;
+            presetKey = presetKey?.ToLower();
+            if (string.IsNullOrEmpty(presetKey) || !IsValidPresetKey(presetKey)) presetKey = Preset5v5;
+            if (string.IsNullOrEmpty(arenaName) || _data?.Arenas == null || _data.Arenas.Count == 0) return null;
             var arena = _data.Arenas.FirstOrDefault(a => a.Name == arenaName) ?? _data.Arenas.FirstOrDefault();
             if (arena == null) return null;
             var key = GetSessionKey(arena.Name, presetKey);
@@ -250,8 +260,8 @@ namespace Oxide.Plugins
             return session;
         }
 
-        private MatchSession GetAdminViewSession() => GetOrCreateSession(_activeArena?.Name ?? _data?.ActiveArenaName, _currentRules?.PresetKey ?? "5v5");
-        private bool IsValidPresetKey(string presetKey) => presetKey == "5v5" || presetKey == "1v1" || presetKey == "2v2";
+        private MatchSession GetAdminViewSession() => GetOrCreateSession(_activeArena?.Name ?? _data?.ActiveArenaName, _currentRules?.PresetKey ?? Preset5v5);
+        private bool IsValidPresetKey(string presetKey) => PresetRuleTemplates.ContainsKey(presetKey?.ToLower() ?? string.Empty);
 
         private MatchSession GetPlayerSession(ulong userId)
         {
@@ -266,8 +276,8 @@ namespace Oxide.Plugins
                 selection = new PlayerSelection();
                 _playerSelections[userId] = selection;
             }
-            selection.PresetKey = selection.PresetKey?.ToLower();
-            if (string.IsNullOrEmpty(selection.PresetKey) || !IsValidPresetKey(selection.PresetKey)) selection.PresetKey = _currentRules?.PresetKey ?? "5v5";
+            if (!string.IsNullOrEmpty(selection.PresetKey)) selection.PresetKey = selection.PresetKey.ToLower();
+            if (string.IsNullOrEmpty(selection.PresetKey) || !IsValidPresetKey(selection.PresetKey)) selection.PresetKey = _currentRules?.PresetKey ?? Preset5v5;
             if (string.IsNullOrEmpty(selection.ArenaName) || (_data?.Arenas != null && _data.Arenas.All(a => a.Name != selection.ArenaName)))
             {
                 selection.ArenaName = _activeArena?.Name ?? _data?.Arenas?.FirstOrDefault()?.Name;
@@ -283,7 +293,6 @@ namespace Oxide.Plugins
         {
             _instance = this;
             permission.RegisterPermission(PermAdmin, this);
-            _currentRules = GetPresetRules("5v5");
             LoadData();
         }
 
@@ -371,7 +380,7 @@ namespace Oxide.Plugins
         {
             try
             {
-                var session = GetOrCreateSession(_activeArena?.Name ?? _data?.ActiveArenaName, _currentRules?.PresetKey ?? "5v5");
+                var session = GetOrCreateSession(_activeArena?.Name ?? _data?.ActiveArenaName, _currentRules?.PresetKey ?? Preset5v5);
                 if (session == null) return null;
                 var teamCounts = new Dictionary<string, int>();
                 var teamScores = new Dictionary<string, int>();
@@ -571,10 +580,7 @@ namespace Oxide.Plugins
 
             if (session.AlivePlayers.Count == 0)
             {
-                CleanupRustTeams(session);
-                session.CurrentTeamA = Team.None;
-                session.CurrentTeamB = Team.None;
-                session.State = GameState.Lobby;
+                ResetSessionState(session);
                 BroadcastToSession(session, "No players available to start.");
                 return;
             }
@@ -787,7 +793,7 @@ namespace Oxide.Plugins
         private void ShowInfo(BasePlayer player)
         {
             SendReply(player, "<color=#ffcc00>[PAINTBALL]</color> Updates:");
-            SendReply(player, "• Multi-session matches per arena/preset (5v5, 1v1, 2v2) running together.");
+            SendReply(player, $"• Multi-session matches per arena/preset ({Preset5v5}, {Preset1v1}, {Preset2v2}) running together.");
             SendReply(player, "• Ordered join flow: select arena → mode → join, then pick team in a colored lobby zone.");
             SendReply(player, "• Session-based HUD, scoring, and team caps for clearer matches.");
         }
@@ -840,24 +846,27 @@ namespace Oxide.Plugins
             _playerSessions.Clear();
         }
 
-        private void ResetSession(MatchSession session)
+        private void ResetSessionState(MatchSession session)
         {
             session.GameTimer?.Destroy();
             CleanupRustTeams(session);
-            foreach (var ent in session.ArenaEntities) { if (ent != null && !ent.IsDestroyed) ent.Kill(); }
-            session.ArenaEntities.Clear();
-            session.Players.Clear();
-            session.AlivePlayers.Clear();
-            session.PlayerTeams.Clear();
             session.CurrentTeamA = Team.None;
             session.CurrentTeamB = Team.None;
+            session.AlivePlayers.Clear();
             session.TeamScores.Clear();
             session.State = GameState.Lobby;
             session.SecondsRemaining = 0;
-            if (!string.IsNullOrEmpty(session.ArenaName) && !string.IsNullOrEmpty(session.PresetKey))
-            {
-                _sessions.Remove(GetSessionKey(session.ArenaName, session.PresetKey));
-            }
+        }
+
+        private void ResetSession(MatchSession session)
+        {
+            if (session.Players.Count > 0) return;
+            foreach (var ent in session.ArenaEntities) { if (ent != null && !ent.IsDestroyed) ent.Kill(); }
+            session.ArenaEntities.Clear();
+            session.Players.Clear();
+            session.PlayerTeams.Clear();
+            ResetSessionState(session);
+            _sessions.Remove(GetSessionKey(session.ArenaName ?? string.Empty, session.PresetKey ?? string.Empty));
         }
 
         private Team GetTeam(MatchSession session, ulong uid) => session.PlayerTeams.ContainsKey(uid) ? session.PlayerTeams[uid] : Team.None;
@@ -934,9 +943,9 @@ namespace Oxide.Plugins
                 }
 
                 y -= 0.02f; AddHeader(e, p, $"ACTIVE RULES: {_currentRules.PresetName}", y); y -= 0.04f;
-                AddButtonRaw(e, p, "SET 5v5 TDM", "pb_ui set_mode 5v5", "0.2 0.2 0.5 0.9", Invariant($"0.05 {y-h}"), Invariant($"0.95 {y}")); y -= (h+g);
-                AddButtonRaw(e, p, "SET 1v1 DUEL", "pb_ui set_mode 1v1", "0.2 0.2 0.5 0.9", Invariant($"0.05 {y-h}"), Invariant($"0.95 {y}")); y -= (h+g);
-                AddButtonRaw(e, p, "SET 2v2 ELIM", "pb_ui set_mode 2v2", "0.2 0.2 0.5 0.9", Invariant($"0.05 {y-h}"), Invariant($"0.95 {y}"));
+                AddButtonRaw(e, p, "SET 5v5 TDM", $"pb_ui set_mode {Preset5v5}", "0.2 0.2 0.5 0.9", Invariant($"0.05 {y-h}"), Invariant($"0.95 {y}")); y -= (h+g);
+                AddButtonRaw(e, p, "SET 1v1 DUEL", $"pb_ui set_mode {Preset1v1}", "0.2 0.2 0.5 0.9", Invariant($"0.05 {y-h}"), Invariant($"0.95 {y}")); y -= (h+g);
+                AddButtonRaw(e, p, "SET 2v2 ELIM", $"pb_ui set_mode {Preset2v2}", "0.2 0.2 0.5 0.9", Invariant($"0.05 {y-h}"), Invariant($"0.95 {y}"));
             }
             else if (page == "setup")
             {
@@ -982,10 +991,10 @@ namespace Oxide.Plugins
             }
 
             y -= 0.02f; AddHeader(e, p, "STEP 2: SELECT MODE", y); y -= 0.04f;
-            string preset = selection.PresetKey ?? "5v5";
-            AddButtonRaw(e, p, "5v5 TDM", "pb_ui_join preset 5v5", preset == "5v5" ? "0.3 0.8 0.3 0.9" : "0.3 0.3 0.3 0.9", Invariant($"0.05 {y-h}"), Invariant($"0.95 {y}")); y -= (h+g);
-            AddButtonRaw(e, p, "1v1 DUEL", "pb_ui_join preset 1v1", preset == "1v1" ? "0.3 0.8 0.3 0.9" : "0.3 0.3 0.3 0.9", Invariant($"0.05 {y-h}"), Invariant($"0.95 {y}")); y -= (h+g);
-            AddButtonRaw(e, p, "2v2 ELIM", "pb_ui_join preset 2v2", preset == "2v2" ? "0.3 0.8 0.3 0.9" : "0.3 0.3 0.3 0.9", Invariant($"0.05 {y-h}"), Invariant($"0.95 {y}")); y -= (h+g);
+            string preset = selection.PresetKey ?? Preset5v5;
+            AddButtonRaw(e, p, "5v5 TDM", $"pb_ui_join preset {Preset5v5}", preset == Preset5v5 ? "0.3 0.8 0.3 0.9" : "0.3 0.3 0.3 0.9", Invariant($"0.05 {y-h}"), Invariant($"0.95 {y}")); y -= (h+g);
+            AddButtonRaw(e, p, "1v1 DUEL", $"pb_ui_join preset {Preset1v1}", preset == Preset1v1 ? "0.3 0.8 0.3 0.9" : "0.3 0.3 0.3 0.9", Invariant($"0.05 {y-h}"), Invariant($"0.95 {y}")); y -= (h+g);
+            AddButtonRaw(e, p, "2v2 ELIM", $"pb_ui_join preset {Preset2v2}", preset == Preset2v2 ? "0.3 0.8 0.3 0.9" : "0.3 0.3 0.3 0.9", Invariant($"0.05 {y-h}"), Invariant($"0.95 {y}")); y -= (h+g);
 
             y -= 0.02f; AddHeader(e, p, "STEP 3: JOIN", y); y -= 0.04f;
             AddButtonRaw(e, p, "JOIN MATCH", "pb_ui_join join", "0.2 0.6 0.2 0.9", Invariant($"0.05 {y-h}"), Invariant($"0.95 {y}"));
