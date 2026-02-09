@@ -104,8 +104,8 @@ namespace Oxide.Plugins
 
         private class MatchRules
         {
-            public string PresetKey = "5v5";
-            public string PresetName = "5v5 TDM";
+            public string PresetKey;
+            public string PresetName;
             public GameMode Mode = GameMode.TeamDeathmatch;
             public int ScoreLimit = 10; // 0 = unlimited/elimination only
             public int TeamSize = 5;
@@ -250,7 +250,7 @@ namespace Oxide.Plugins
             return session;
         }
 
-        private MatchSession GetAdminSession() => GetOrCreateSession(_activeArena?.Name ?? _data?.ActiveArenaName, _currentRules?.PresetKey ?? "5v5");
+        private MatchSession GetAdminViewSession() => GetOrCreateSession(_activeArena?.Name ?? _data?.ActiveArenaName, _currentRules?.PresetKey ?? "5v5");
         private bool IsValidPresetKey(string presetKey) => presetKey == "5v5" || presetKey == "1v1" || presetKey == "2v2";
 
         private MatchSession GetPlayerSession(ulong userId)
@@ -569,6 +569,16 @@ namespace Oxide.Plugins
                 else MoveToSpectate(session, p);
             }
 
+            if (session.AlivePlayers.Count == 0)
+            {
+                CleanupRustTeams(session);
+                session.CurrentTeamA = Team.None;
+                session.CurrentTeamB = Team.None;
+                session.State = GameState.Lobby;
+                BroadcastToSession(session, "No players available to start.");
+                return;
+            }
+
             session.SecondsRemaining = _config.GameDuration;
             session.GameTimer = timer.Repeat(1f, session.SecondsRemaining, () =>
             {
@@ -778,7 +788,7 @@ namespace Oxide.Plugins
         {
             SendReply(player, "<color=#ffcc00>[PAINTBALL]</color> Updates:");
             SendReply(player, "• Multi-session matches per arena/preset (5v5, 1v1, 2v2) running together.");
-            SendReply(player, "• Ordered join flow: select arena → mode → join, then pick team in color zone.");
+            SendReply(player, "• Ordered join flow: select arena → mode → join, then pick team in a colored lobby zone.");
             SendReply(player, "• Session-based HUD, scoring, and team caps for clearer matches.");
         }
 
@@ -791,7 +801,7 @@ namespace Oxide.Plugins
             session.PlayerTeams[player.userID] = Team.None;
             _playerSessions[player.userID] = session;
             player.Teleport(_data.LobbySpawn.ToVector3());
-            SendReply(player, $"Joined {session.ArenaName} ({session.Rules.PresetName}). Choose a team in the color zone.");
+            SendReply(player, $"Joined {session.ArenaName} ({session.Rules.PresetName}). Walk to a colored lobby zone to choose your team.");
             CuiHelper.DestroyUi(player, LayerJoin);
             if (session.Players.Count >= _config.MinPlayers && session.State == GameState.Lobby) StartLobbyCountdown(session);
         }
@@ -844,6 +854,10 @@ namespace Oxide.Plugins
             session.TeamScores.Clear();
             session.State = GameState.Lobby;
             session.SecondsRemaining = 0;
+            if (!string.IsNullOrEmpty(session.ArenaName) && !string.IsNullOrEmpty(session.PresetKey))
+            {
+                _sessions.Remove(GetSessionKey(session.ArenaName, session.PresetKey));
+            }
         }
 
         private Team GetTeam(MatchSession session, ulong uid) => session.PlayerTeams.ContainsKey(uid) ? session.PlayerTeams[uid] : Team.None;
@@ -978,7 +992,7 @@ namespace Oxide.Plugins
 
             string arenaName = selection.ArenaName ?? "Select Arena";
             string presetName = GetPresetRules(preset).PresetName;
-            e.Add(new CuiLabel { Text = { Text = $"Selected: {arenaName} / {presetName}\nSelect arena & mode, then choose team in color zone.", FontSize = 11, Align = TextAnchor.MiddleCenter, Color = "0.8 0.8 0.8 1", Font = "robotocondensed-regular.ttf" }, RectTransform = { AnchorMin = "0.05 0.02", AnchorMax = "0.95 0.12" } }, p);
+            e.Add(new CuiLabel { Text = { Text = $"Selected: {arenaName} / {presetName}\nSelect arena & mode, then walk to a colored lobby zone to choose your team.", FontSize = 11, Align = TextAnchor.MiddleCenter, Color = "0.8 0.8 0.8 1", Font = "robotocondensed-regular.ttf" }, RectTransform = { AnchorMin = "0.05 0.02", AnchorMax = "0.95 0.12" } }, p);
 
             CuiHelper.AddUi(player, e);
         }
@@ -1035,14 +1049,14 @@ namespace Oxide.Plugins
                 case "close": CuiHelper.DestroyUi(p, LayerMenu); break;
                 case "start":
                 {
-                    var session = GetAdminSession();
+                    var session = GetAdminViewSession();
                     if (session != null) StartMatch(session, true);
                     OpenMenu(p, "game");
                     break;
                 }
                 case "stop":
                 {
-                    var session = GetAdminSession();
+                    var session = GetAdminViewSession();
                     if (session != null) EndGame(session, "Admin Stopped");
                     OpenMenu(p, "game");
                     break;
@@ -1115,7 +1129,7 @@ namespace Oxide.Plugins
                     if (arg.HasArgs(2)) { selection.ArenaName = arg.GetString(1); OpenJoinMenu(p); }
                     break;
                 case "preset":
-                    if (arg.HasArgs(2)) { selection.PresetKey = arg.GetString(1).ToLower(); OpenJoinMenu(p); }
+                    if (arg.HasArgs(2)) { selection.PresetKey = arg.GetString(1); OpenJoinMenu(p); }
                     break;
                 case "join":
                     if (!TryJoinSelected(p, false)) OpenJoinMenu(p);
