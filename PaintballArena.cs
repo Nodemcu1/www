@@ -393,7 +393,14 @@ namespace Oxide.Plugins
         {
             try
             {
-                var session = GetOrCreateSession(_activeArena?.Name ?? _data?.ActiveArenaName, _currentRules?.PresetKey ?? Preset5v5);
+                var sessionKey = GetSessionKey(_activeArena?.Name ?? _data?.ActiveArenaName, _currentRules?.PresetKey ?? Preset5v5);
+                _sessions.TryGetValue(sessionKey, out var session);
+                if (session == null)
+                {
+                    session = _sessions.Values.FirstOrDefault(s => s.State == GameState.Active)
+                        ?? _sessions.Values.FirstOrDefault(s => s.Players.Count > 0);
+                }
+                session ??= GetOrCreateSession(_activeArena?.Name ?? _data?.ActiveArenaName, _currentRules?.PresetKey ?? Preset5v5);
                 if (session == null) return null;
                 var teamCounts = new Dictionary<string, int>();
                 var teamScores = new Dictionary<string, int>();
@@ -563,16 +570,6 @@ namespace Oxide.Plugins
                 session.CurrentTeamB = sortedTeams[1];
             }
 
-            session.State = GameState.Active;
-            session.AlivePlayers.Clear();
-            session.ArenaEntities.Clear();
-            session.TeamScores.Clear();
-            foreach(Team t in Enum.GetValues(typeof(Team))) session.TeamScores[t] = 0;
-
-            string vsText = (session.CurrentTeamB == Team.None) ? "PRACTICE MODE" : $"{session.CurrentTeamA} VS {session.CurrentTeamB}";
-            BroadcastToSession(session, $"<size=20>MATCH STARTED: {vsText}</size>");
-            BroadcastToSession(session, $"MODE: {session.Rules.PresetName} on ARENA: {session.Arena.Name}");
-
             bool hasActivePlayers = session.Players.Any(uid =>
             {
                 var team = GetTeam(session, uid);
@@ -584,6 +581,16 @@ namespace Oxide.Plugins
                 BroadcastToSession(session, "No players available to start.");
                 return;
             }
+
+            session.State = GameState.Active;
+            session.AlivePlayers.Clear();
+            session.ArenaEntities.Clear();
+            session.TeamScores.Clear();
+            foreach(Team t in Enum.GetValues(typeof(Team))) session.TeamScores[t] = 0;
+
+            string vsText = (session.CurrentTeamB == Team.None) ? "PRACTICE MODE" : $"{session.CurrentTeamA} VS {session.CurrentTeamB}";
+            BroadcastToSession(session, $"<size=20>MATCH STARTED: {vsText}</size>");
+            BroadcastToSession(session, $"MODE: {session.Rules.PresetName} on ARENA: {session.Arena.Name}");
 
             CreateRustTeams(session);
 
@@ -785,7 +792,7 @@ namespace Oxide.Plugins
             {
                 if (openMenuIfMissing)
                 {
-                    SendReply(player, "Select arena & mode to join.");
+                    SendReply(player, "Select arena and mode to join.");
                     OpenJoinMenu(player);
                 }
                 return false;
@@ -820,7 +827,7 @@ namespace Oxide.Plugins
         private void JoinGame(BasePlayer player, MatchSession session)
         {
             if (session == null || GetPlayerSession(player.userID) != null) return;
-            if (_data.LobbySpawn == null) { SendReply(player, "Lobby not set."); return; }
+            if (_data.LobbySpawn == null) { SendReply(player, "Lobby spawn not configured. Contact an admin."); return; }
             SaveAndClearInventory(player);
             session.Players.Add(player.userID);
             session.PlayerTeams[player.userID] = Team.None;
@@ -845,7 +852,7 @@ namespace Oxide.Plugins
             CuiHelper.DestroyUi(player, LayerJoin);
             RestoreInventory(player);
             if (_data.ExitSpawn != null) player.Teleport(_data.ExitSpawn.ToVector3());
-            if (session.Players.Count == 0) ResetSession(session);
+            ResetSession(session);
         }
 
         private void CleanupGame()
