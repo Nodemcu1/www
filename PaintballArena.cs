@@ -34,6 +34,7 @@ namespace Oxide.Plugins
         {
             public string ArenaName;
             public string PresetKey;
+            public string SessionKey;
             public ArenaProfile Arena;
             public MatchRules Rules;
             public GameState State = GameState.Lobby;
@@ -56,7 +57,7 @@ namespace Oxide.Plugins
         }
 
         // Runtime Logic
-        private MatchRules _currentRules = GetPresetRules(Preset5v5);
+        private MatchRules _currentRules;
         private ArenaProfile _activeArena = null;
         private readonly Dictionary<string, MatchSession> _sessions = new Dictionary<string, MatchSession>();
         private readonly Dictionary<ulong, MatchSession> _playerSessions = new Dictionary<ulong, MatchSession>();
@@ -107,7 +108,7 @@ namespace Oxide.Plugins
 
         private class MatchRules
         {
-            // PresetKey should be one of the preset constants (5v5, 1v1, 2v2).
+            // PresetKey should be one of: Preset5v5 ("5v5"), Preset1v1 ("1v1"), Preset2v2 ("2v2") - lowercase.
             public string PresetKey;
             public string PresetName;
             public GameMode Mode = GameMode.TeamDeathmatch;
@@ -228,14 +229,24 @@ namespace Oxide.Plugins
             [Preset2v2] = new MatchRules { PresetKey = Preset2v2, PresetName = "2v2 Elim", Mode = GameMode.Elimination, ScoreLimit = 0, TeamSize = 2, Respawn = false }
         };
 
+        private static MatchRules CloneRules(MatchRules template) => new MatchRules
+        {
+            PresetKey = template.PresetKey,
+            PresetName = template.PresetName,
+            Mode = template.Mode,
+            ScoreLimit = template.ScoreLimit,
+            TeamSize = template.TeamSize,
+            Respawn = template.Respawn
+        };
+
         private static MatchRules GetPresetRules(string presetKey)
         {
             presetKey = presetKey?.ToLower();
             if (string.IsNullOrEmpty(presetKey) || !PresetRuleTemplates.TryGetValue(presetKey, out var rules))
             {
-                return PresetRuleTemplates[Preset5v5];
+                return CloneRules(PresetRuleTemplates[Preset5v5]);
             }
-            return rules;
+            return CloneRules(rules);
         }
 
         private MatchSession GetOrCreateSession(string arenaName, string presetKey)
@@ -248,13 +259,14 @@ namespace Oxide.Plugins
             var key = GetSessionKey(arena.Name, presetKey);
             if (!_sessions.TryGetValue(key, out var session))
             {
-                session = new MatchSession { ArenaName = arena.Name, PresetKey = presetKey, Arena = arena, Rules = GetPresetRules(presetKey) };
+                session = new MatchSession { ArenaName = arena.Name, PresetKey = presetKey, SessionKey = key, Arena = arena, Rules = GetPresetRules(presetKey) };
                 _sessions[key] = session;
             }
             else
             {
                 session.Arena = arena;
                 session.ArenaName = arena.Name;
+                session.SessionKey = key;
                 session.Rules ??= GetPresetRules(presetKey);
             }
             return session;
@@ -293,6 +305,7 @@ namespace Oxide.Plugins
         {
             _instance = this;
             permission.RegisterPermission(PermAdmin, this);
+            _currentRules = GetPresetRules(Preset5v5);
             LoadData();
         }
 
@@ -560,6 +573,18 @@ namespace Oxide.Plugins
             BroadcastToSession(session, $"<size=20>MATCH STARTED: {vsText}</size>");
             BroadcastToSession(session, $"MODE: {session.Rules.PresetName} on ARENA: {session.Arena.Name}");
 
+            bool hasActivePlayers = session.Players.Any(uid =>
+            {
+                var team = GetTeam(session, uid);
+                return (team == session.CurrentTeamA || team == session.CurrentTeamB) && BasePlayer.FindByID(uid) != null;
+            });
+            if (!hasActivePlayers)
+            {
+                ResetSessionState(session);
+                BroadcastToSession(session, "No players available to start.");
+                return;
+            }
+
             CreateRustTeams(session);
 
             foreach (var uid in session.Players)
@@ -576,13 +601,6 @@ namespace Oxide.Plugins
                     SetupPlayer(session, p, t, t == session.CurrentTeamA);
                 }
                 else MoveToSpectate(session, p);
-            }
-
-            if (session.AlivePlayers.Count == 0)
-            {
-                ResetSessionState(session);
-                BroadcastToSession(session, "No players available to start.");
-                return;
             }
 
             session.SecondsRemaining = _config.GameDuration;
@@ -792,8 +810,9 @@ namespace Oxide.Plugins
 
         private void ShowInfo(BasePlayer player)
         {
+            string presetInfo = $"{PresetRuleTemplates[Preset5v5].PresetName}, {PresetRuleTemplates[Preset1v1].PresetName}, {PresetRuleTemplates[Preset2v2].PresetName}";
             SendReply(player, "<color=#ffcc00>[PAINTBALL]</color> Updates:");
-            SendReply(player, $"• Multi-session matches per arena/preset ({Preset5v5}, {Preset1v1}, {Preset2v2}) running together.");
+            SendReply(player, $"• Multi-session matches per arena/preset ({presetInfo}) running together.");
             SendReply(player, "• Ordered join flow: select arena → mode → join, then pick team in a colored lobby zone.");
             SendReply(player, "• Session-based HUD, scoring, and team caps for clearer matches.");
         }
@@ -866,7 +885,8 @@ namespace Oxide.Plugins
             session.Players.Clear();
             session.PlayerTeams.Clear();
             ResetSessionState(session);
-            _sessions.Remove(GetSessionKey(session.ArenaName ?? string.Empty, session.PresetKey ?? string.Empty));
+            if (!string.IsNullOrEmpty(session.SessionKey)) _sessions.Remove(session.SessionKey);
+            else _sessions.Remove(GetSessionKey(session.ArenaName ?? string.Empty, session.PresetKey ?? string.Empty));
         }
 
         private Team GetTeam(MatchSession session, ulong uid) => session.PlayerTeams.ContainsKey(uid) ? session.PlayerTeams[uid] : Team.None;
@@ -1001,7 +1021,7 @@ namespace Oxide.Plugins
 
             string arenaName = selection.ArenaName ?? "Select Arena";
             string presetName = GetPresetRules(preset).PresetName;
-            e.Add(new CuiLabel { Text = { Text = $"Selected: {arenaName} / {presetName}\nSelect arena & mode, then walk to a colored lobby zone to choose your team.", FontSize = 11, Align = TextAnchor.MiddleCenter, Color = "0.8 0.8 0.8 1", Font = "robotocondensed-regular.ttf" }, RectTransform = { AnchorMin = "0.05 0.02", AnchorMax = "0.95 0.12" } }, p);
+            e.Add(new CuiLabel { Text = { Text = $"Selected: {arenaName} / {presetName}\nAfter clicking JOIN MATCH, walk to a colored lobby zone to choose your team.", FontSize = 11, Align = TextAnchor.MiddleCenter, Color = "0.8 0.8 0.8 1", Font = "robotocondensed-regular.ttf" }, RectTransform = { AnchorMin = "0.05 0.02", AnchorMax = "0.95 0.12" } }, p);
 
             CuiHelper.AddUi(player, e);
         }
