@@ -23,7 +23,6 @@ namespace Oxide.Plugins
 
         // State
         private enum GameState { Lobby, Starting, Active, Ending }
-        private GameState _currentState = GameState.Lobby;
 
         // Teams
         private enum Team { None, Green, Orange, Blue, Yellow, Purple }
@@ -31,30 +30,45 @@ namespace Oxide.Plugins
         // Game Modes
         private enum GameMode { TeamDeathmatch, Elimination }
 
-        // Runtime Logic
-        private MatchRules _currentRules = new MatchRules();
-        private ArenaProfile _activeArena = null;
+        private class MatchSession
+        {
+            public string ArenaName;
+            public string PresetKey;
+            public string SessionKey;
+            public ArenaProfile Arena;
+            public MatchRules Rules;
+            public GameState State = GameState.Lobby;
+            public List<ulong> Players = new List<ulong>();
+            public HashSet<ulong> AlivePlayers = new HashSet<ulong>();
+            public Dictionary<ulong, Team> PlayerTeams = new Dictionary<ulong, Team>();
+            public Team CurrentTeamA = Team.None;
+            public Team CurrentTeamB = Team.None;
+            public Dictionary<Team, int> TeamScores = new Dictionary<Team, int>();
+            public List<BaseEntity> ArenaEntities = new List<BaseEntity>();
+            public Dictionary<Team, ulong> RustTeamIDs = new Dictionary<Team, ulong>();
+            public Timer GameTimer;
+            public int SecondsRemaining;
+        }
 
-        // Participants
-        private List<ulong> _players = new List<ulong>(); 
-        private HashSet<ulong> _alivePlayers = new HashSet<ulong>(); 
-        private Dictionary<ulong, Team> _playerTeams = new Dictionary<ulong, Team>();
-        private Dictionary<ulong, PlayerRestoreData> _restoreData = new Dictionary<ulong, PlayerRestoreData>();
-        
-        // Match Variables
-        private Team _currentTeamA = Team.None;
-        private Team _currentTeamB = Team.None;
-        private Dictionary<Team, int> _teamScores = new Dictionary<Team, int>();
+        private class PlayerSelection
+        {
+            public string ArenaName;
+            public string PresetKey;
+        }
+
+        // Runtime Logic
+        private MatchRules _currentRules;
+        private ArenaProfile _activeArena = null;
+        private readonly Dictionary<string, MatchSession> _sessions = new Dictionary<string, MatchSession>();
+        private readonly Dictionary<ulong, MatchSession> _playerSessions = new Dictionary<ulong, MatchSession>();
+        private readonly Dictionary<ulong, PlayerSelection> _playerSelections = new Dictionary<ulong, PlayerSelection>();
+        private readonly Dictionary<ulong, PlayerRestoreData> _restoreData = new Dictionary<ulong, PlayerRestoreData>();
 
         // Cleanup
-        private List<BaseEntity> _arenaEntities = new List<BaseEntity>();
-        private List<BaseEntity> _visualSpheres = new List<BaseEntity>();
-        private Dictionary<Team, ulong> _rustTeamIDs = new Dictionary<Team, ulong>();
+        private readonly List<BaseEntity> _visualSpheres = new List<BaseEntity>();
 
         // Timers
-        private Timer _gameTimer;
         private Timer _zoneTimer;
-        private int _secondsRemaining;
 
         // Toggles
         private bool _allowMeds = false;
@@ -64,6 +78,10 @@ namespace Oxide.Plugins
         private const string PermAdmin = "paintballarena.admin";
         private const string LayerUI = "UI_Paintball_HUD";
         private const string LayerMenu = "UI_Paintball_Menu";
+        private const string LayerJoin = "UI_Paintball_Join";
+        private const string Preset5v5 = "5v5";
+        private const string Preset1v1 = "1v1";
+        private const string Preset2v2 = "2v2";
         private const string SpherePrefab = "assets/prefabs/visualization/sphere.prefab";
 
         #endregion
@@ -90,7 +108,9 @@ namespace Oxide.Plugins
 
         private class MatchRules
         {
-            public string PresetName = "Standard 5v5";
+            // PresetKey should use the preset constants (Preset5v5/Preset1v1/Preset2v2); their values are lowercase.
+            public string PresetKey;
+            public string PresetName;
             public GameMode Mode = GameMode.TeamDeathmatch;
             public int ScoreLimit = 10; // 0 = unlimited/elimination only
             public int TeamSize = 5;
@@ -190,6 +210,93 @@ namespace Oxide.Plugins
         private string Invariant(string s) => s;
         private string Invariant(FormattableString s) => s.ToString(CultureInfo.InvariantCulture);
 
+        private void BroadcastToSession(MatchSession session, string msg)
+        {
+            string text = $"<color=#ffcc00>[PAINTBALL]</color> {msg}";
+            foreach (var uid in session.Players)
+            {
+                var p = BasePlayer.FindByID(uid);
+                if (p != null) SendReply(p, text);
+            }
+        }
+
+        private string GetSessionKey(string arenaName, string presetKey) => $"{arenaName}:{presetKey}";
+
+        private static readonly Dictionary<string, MatchRules> PresetRuleTemplates = new Dictionary<string, MatchRules>
+        {
+            [Preset5v5] = new MatchRules { PresetKey = Preset5v5, PresetName = "5v5 TDM", Mode = GameMode.TeamDeathmatch, ScoreLimit = 10, TeamSize = 5, Respawn = true },
+            [Preset1v1] = new MatchRules { PresetKey = Preset1v1, PresetName = "1v1 Duel", Mode = GameMode.TeamDeathmatch, ScoreLimit = 3, TeamSize = 1, Respawn = true },
+            [Preset2v2] = new MatchRules { PresetKey = Preset2v2, PresetName = "2v2 Elim", Mode = GameMode.Elimination, ScoreLimit = 0, TeamSize = 2, Respawn = false }
+        };
+
+        private static MatchRules CloneRules(MatchRules template) => new MatchRules
+        {
+            PresetKey = template.PresetKey,
+            PresetName = template.PresetName,
+            Mode = template.Mode,
+            ScoreLimit = template.ScoreLimit,
+            TeamSize = template.TeamSize,
+            Respawn = template.Respawn
+        };
+
+        private static MatchRules GetPresetRules(string presetKey)
+        {
+            presetKey = presetKey?.ToLower();
+            if (string.IsNullOrEmpty(presetKey) || !PresetRuleTemplates.TryGetValue(presetKey, out var rules))
+            {
+                return CloneRules(PresetRuleTemplates[Preset5v5]);
+            }
+            return CloneRules(rules);
+        }
+
+        private MatchSession GetOrCreateSession(string arenaName, string presetKey)
+        {
+            presetKey = presetKey?.ToLower();
+            if (string.IsNullOrEmpty(presetKey) || !IsValidPresetKey(presetKey)) presetKey = Preset5v5;
+            if (string.IsNullOrEmpty(arenaName) || _data?.Arenas == null || _data.Arenas.Count == 0) return null;
+            var arena = _data.Arenas.FirstOrDefault(a => a.Name == arenaName) ?? _data.Arenas.FirstOrDefault();
+            if (arena == null) return null;
+            var key = GetSessionKey(arena.Name, presetKey);
+            if (!_sessions.TryGetValue(key, out var session))
+            {
+                session = new MatchSession { ArenaName = arena.Name, PresetKey = presetKey, SessionKey = key, Arena = arena, Rules = GetPresetRules(presetKey) };
+                _sessions[key] = session;
+            }
+            else
+            {
+                session.Arena = arena;
+                session.ArenaName = arena.Name;
+                session.SessionKey = key;
+                session.Rules ??= GetPresetRules(presetKey);
+            }
+            return session;
+        }
+
+        private MatchSession GetAdminViewSession() => GetOrCreateSession(_activeArena?.Name ?? _data?.ActiveArenaName, _currentRules?.PresetKey ?? Preset5v5);
+        private bool IsValidPresetKey(string presetKey) => PresetRuleTemplates.ContainsKey(presetKey?.ToLower() ?? string.Empty);
+
+        private MatchSession GetPlayerSession(ulong userId)
+        {
+            _playerSessions.TryGetValue(userId, out var session);
+            return session;
+        }
+
+        private PlayerSelection GetPlayerSelection(ulong userId)
+        {
+            if (!_playerSelections.TryGetValue(userId, out var selection))
+            {
+                selection = new PlayerSelection();
+                _playerSelections[userId] = selection;
+            }
+            selection.PresetKey = selection.PresetKey?.ToLower();
+            if (string.IsNullOrEmpty(selection.PresetKey) || !IsValidPresetKey(selection.PresetKey)) selection.PresetKey = _currentRules?.PresetKey ?? Preset5v5;
+            if (string.IsNullOrEmpty(selection.ArenaName) || (_data?.Arenas != null && _data.Arenas.All(a => a.Name != selection.ArenaName)))
+            {
+                selection.ArenaName = _activeArena?.Name ?? _data?.Arenas?.FirstOrDefault()?.Name;
+            }
+            return selection;
+        }
+
         #endregion
 
         #region Oxide Hooks
@@ -198,6 +305,7 @@ namespace Oxide.Plugins
         {
             _instance = this;
             permission.RegisterPermission(PermAdmin, this);
+            _currentRules = GetPresetRules(Preset5v5);
             LoadData();
         }
 
@@ -212,23 +320,28 @@ namespace Oxide.Plugins
             CleanupGame();
             DestroyVisualSpheres();
             _zoneTimer?.Destroy();
-            foreach(var p in BasePlayer.activePlayerList) CuiHelper.DestroyUi(p, LayerMenu);
+            foreach(var p in BasePlayer.activePlayerList)
+            {
+                CuiHelper.DestroyUi(p, LayerMenu);
+                CuiHelper.DestroyUi(p, LayerJoin);
+            }
             _instance = null;
         }
 
         private void OnPlayerDisconnected(BasePlayer player)
         {
-            if (_players.Contains(player.userID)) LeaveGame(player);
+            if (GetPlayerSession(player.userID) != null) LeaveGame(player);
         }
 
         private void OnEntityBuilt(Planner plan, GameObject go)
         {
-            if (_currentState != GameState.Active) return;
             var player = plan.GetOwnerPlayer();
-            if (player != null && _players.Contains(player.userID))
+            var session = player != null ? GetPlayerSession(player.userID) : null;
+            if (session == null || session.State != GameState.Active) return;
+            if (player != null)
             {
                 var entity = go.GetComponent<BaseEntity>();
-                if (entity != null) _arenaEntities.Add(entity);
+                if (entity != null) session.ArenaEntities.Add(entity);
             }
         }
 
@@ -239,30 +352,35 @@ namespace Oxide.Plugins
 
             if (victim == null || attacker == null) return null;
 
-            Team vTeam = GetTeam(victim.userID);
-            Team aTeam = GetTeam(attacker.userID);
+            var vSession = GetPlayerSession(victim.userID);
+            var aSession = GetPlayerSession(attacker.userID);
+            if (vSession == null && aSession == null) return null;
+            if (vSession == null || aSession == null || vSession != aSession) return true;
+
+            var session = vSession;
+            Team vTeam = GetTeam(session, victim.userID);
+            Team aTeam = GetTeam(session, attacker.userID);
 
             bool vInGame = vTeam != Team.None;
             bool aInGame = aTeam != Team.None;
 
-            if (!vInGame && !aInGame) return null;
             if (vInGame != aInGame) return true; 
-            if (_currentState != GameState.Active) return true; 
+            if (session.State != GameState.Active) return true; 
             
-            if (vTeam != _currentTeamA && vTeam != _currentTeamB) return true;
-            if (aTeam != _currentTeamA && aTeam != _currentTeamB) return true;
+            if (vTeam != session.CurrentTeamA && vTeam != session.CurrentTeamB) return true;
+            if (aTeam != session.CurrentTeamA && aTeam != session.CurrentTeamB) return true;
             if (vTeam == aTeam) return true; 
 
             // One Shot Kill Logic
             info.damageTypes.ScaleAll(0);
-            EliminatePlayer(attacker, victim);
+            EliminatePlayer(session, attacker, victim);
             
             return true; 
         }
 
         private object OnItemDropped(Item item, BaseEntity entity)
         {
-            if (entity is BasePlayer p && _players.Contains(p.userID)) return false;
+            if (entity is BasePlayer p && GetPlayerSession(p.userID) != null) return false;
             return null;
         }
 
@@ -275,6 +393,15 @@ namespace Oxide.Plugins
         {
             try
             {
+                var sessionKey = GetSessionKey(_activeArena?.Name ?? _data?.ActiveArenaName, _currentRules?.PresetKey ?? Preset5v5);
+                _sessions.TryGetValue(sessionKey, out var session);
+                if (session == null)
+                {
+                    session = _sessions.Values.FirstOrDefault(s => s.State == GameState.Active)
+                        ?? _sessions.Values.FirstOrDefault(s => s.Players.Count > 0);
+                }
+                session ??= GetOrCreateSession(_activeArena?.Name ?? _data?.ActiveArenaName, _currentRules?.PresetKey ?? Preset5v5);
+                if (session == null) return null;
                 var teamCounts = new Dictionary<string, int>();
                 var teamScores = new Dictionary<string, int>();
 
@@ -282,12 +409,12 @@ namespace Oxide.Plugins
                 {
                     if(t == Team.None) continue;
                     teamCounts[t.ToString()] = 0;
-                    teamScores[t.ToString()] = _teamScores.ContainsKey(t) ? _teamScores[t] : 0;
+                    teamScores[t.ToString()] = session.TeamScores.ContainsKey(t) ? session.TeamScores[t] : 0;
                 }
 
-                foreach(var p in _players)
+                foreach(var p in session.Players)
                 {
-                    if(_playerTeams.TryGetValue(p, out Team t) && t != Team.None)
+                    if(session.PlayerTeams.TryGetValue(p, out Team t) && t != Team.None)
                         teamCounts[t.ToString()]++;
                 }
 
@@ -296,18 +423,18 @@ namespace Oxide.Plugins
 
                 return new Dictionary<string, object>
                 {
-                    ["State"] = _currentState.ToString(),
-                    ["Time"] = _secondsRemaining,
-                    ["TeamA"] = _currentTeamA.ToString(),
-                    ["TeamB"] = _currentTeamB.ToString(),
-                    ["PlayersLobby"] = _players.Count,
+                    ["State"] = session.State.ToString(),
+                    ["Time"] = session.SecondsRemaining,
+                    ["TeamA"] = session.CurrentTeamA.ToString(),
+                    ["TeamB"] = session.CurrentTeamB.ToString(),
+                    ["PlayersLobby"] = session.Players.Count,
                     ["TeamCounts"] = teamCounts,
                     ["Scores"] = teamScores,
-                    ["MaxTeamSize"] = _currentRules.TeamSize,
+                    ["MaxTeamSize"] = session.Rules.TeamSize,
                     ["LobbyPos"] = lobbyPos,
-                    ["ScoreLimit"] = _currentRules.ScoreLimit,
-                    ["Arena"] = _activeArena.Name,
-                    ["Mode"] = _currentRules.PresetName
+                    ["ScoreLimit"] = session.Rules.ScoreLimit,
+                    ["Arena"] = session.Arena?.Name,
+                    ["Mode"] = session.Rules.PresetName
                 };
             }
             catch (Exception) { return null; }
@@ -346,39 +473,44 @@ namespace Oxide.Plugins
             foreach (var player in BasePlayer.activePlayerList)
             {
                 if (player == null || !player.IsConnected || player.IsDead()) continue;
+                var session = GetPlayerSession(player.userID);
 
                 // Join Game
                 if (_data.ZoneJoin != null && Vector3.Distance(player.transform.position, _data.ZoneJoin.ToVector3()) < _config.ZoneRadius)
                 {
-                    if (!_players.Contains(player.userID)) JoinGame(player);
+                    if (session == null) TryJoinSelected(player, true);
                 }
                 // Leave Game
                 if (_data.ZoneLeave != null && Vector3.Distance(player.transform.position, _data.ZoneLeave.ToVector3()) < _config.ZoneRadius)
                 {
-                    if (_players.Contains(player.userID)) LeaveGame(player);
+                    if (session != null)
+                    {
+                        LeaveGame(player);
+                        continue;
+                    }
                 }
 
                 // Team Join
-                if (_players.Contains(player.userID) && (_currentState == GameState.Lobby || _currentState == GameState.Starting))
+                if (session != null && (session.State == GameState.Lobby || session.State == GameState.Starting))
                 {
                     foreach (var kvp in _data.ZoneTeams)
                     {
                         if (Vector3.Distance(player.transform.position, kvp.Value.ToVector3()) < _config.ZoneRadius)
                         {
                             Team targetTeam = kvp.Key;
-                            int currentCount = _players.Count(p => _playerTeams.ContainsKey(p) && _playerTeams[p] == targetTeam);
+                            int currentCount = session.Players.Count(p => session.PlayerTeams.ContainsKey(p) && session.PlayerTeams[p] == targetTeam);
                             
                             // Enforce current rule set team size
-                            if (_playerTeams[player.userID] != targetTeam)
+                            if (GetTeam(session, player.userID) != targetTeam)
                             {
-                                if (currentCount >= _currentRules.TeamSize)
+                                if (currentCount >= session.Rules.TeamSize)
                                 {
-                                    SendReply(player, $"Team {targetTeam} is FULL ({currentCount}/{_currentRules.TeamSize}) for Mode: {_currentRules.PresetName}!");
+                                    SendReply(player, $"Team {targetTeam} is FULL ({currentCount}/{session.Rules.TeamSize}) for Mode: {session.Rules.PresetName}!");
                                     continue;
                                 }
-                                _playerTeams[player.userID] = targetTeam;
-                                SendReply(player, $"Joined <color={GetTeamColorHex(targetTeam)}>{targetTeam}</color> ({currentCount + 1}/{_currentRules.TeamSize})");
-                                UpdateHUD(player);
+                                session.PlayerTeams[player.userID] = targetTeam;
+                                SendReply(player, $"Joined <color={GetTeamColorHex(targetTeam)}>{targetTeam}</color> ({currentCount + 1}/{session.Rules.TeamSize})");
+                                UpdateHUD(player, session);
                             }
                         }
                     }
@@ -390,30 +522,30 @@ namespace Oxide.Plugins
 
         #region Game Flow
 
-        private void StartLobbyCountdown()
+        private void StartLobbyCountdown(MatchSession session)
         {
-            if (_currentState == GameState.Starting) return;
-            _currentState = GameState.Starting;
-            _secondsRemaining = _config.LobbyTime;
-            Broadcast($"Match ({_currentRules.PresetName}) starting in {_secondsRemaining}s!");
+            if (session.State == GameState.Starting) return;
+            session.State = GameState.Starting;
+            session.SecondsRemaining = _config.LobbyTime;
+            BroadcastToSession(session, $"Match ({session.Rules.PresetName}) starting in {session.SecondsRemaining}s!");
 
-            _gameTimer?.Destroy();
-            _gameTimer = timer.Repeat(1f, _secondsRemaining, () =>
+            session.GameTimer?.Destroy();
+            session.GameTimer = timer.Repeat(1f, session.SecondsRemaining, () =>
             {
-                _secondsRemaining--;
-                UpdateAllUI();
-                if (_secondsRemaining <= 0) StartMatch(false);
+                session.SecondsRemaining--;
+                UpdateAllUI(session);
+                if (session.SecondsRemaining <= 0) StartMatch(session, false);
             });
         }
 
-        private void StartMatch(bool force = false)
+        private void StartMatch(MatchSession session, bool force = false)
         {
-            _gameTimer?.Destroy();
+            session.GameTimer?.Destroy();
 
             // Calculate Team Counts
             Dictionary<Team, int> counts = new Dictionary<Team, int>();
             foreach(Team t in Enum.GetValues(typeof(Team))) if(t != Team.None) counts[t] = 0;
-            foreach(var p in _players) if (_playerTeams.ContainsKey(p) && _playerTeams[p] != Team.None) counts[_playerTeams[p]]++;
+            foreach(var p in session.Players) if (session.PlayerTeams.ContainsKey(p) && session.PlayerTeams[p] != Team.None) counts[session.PlayerTeams[p]]++;
 
             // Sort
             var sortedTeams = counts.Where(x => x.Value > 0).OrderByDescending(x => x.Value).Select(x => x.Key).ToList();
@@ -422,83 +554,96 @@ namespace Oxide.Plugins
             {
                 if (!force)
                 {
-                    _currentState = GameState.Lobby;
-                    Broadcast("Need at least 2 active teams to start!");
+                    session.State = GameState.Lobby;
+                    BroadcastToSession(session, "Need at least 2 active teams to start!");
                     return;
                 }
                 else
                 {
-                    if (sortedTeams.Count > 0) { _currentTeamA = sortedTeams[0]; _currentTeamB = Team.None; } // Practice
-                    else { _currentState = GameState.Lobby; return; }
+                    if (sortedTeams.Count > 0) { session.CurrentTeamA = sortedTeams[0]; session.CurrentTeamB = Team.None; } // Practice
+                    else { session.State = GameState.Lobby; return; }
                 }
             }
             else
             {
-                _currentTeamA = sortedTeams[0];
-                _currentTeamB = sortedTeams[1];
+                session.CurrentTeamA = sortedTeams[0];
+                session.CurrentTeamB = sortedTeams[1];
             }
 
-            _currentState = GameState.Active;
-            _alivePlayers.Clear();
-            _arenaEntities.Clear();
-            _teamScores.Clear();
-            foreach(Team t in Enum.GetValues(typeof(Team))) _teamScores[t] = 0;
-
-            string vsText = (_currentTeamB == Team.None) ? "PRACTICE MODE" : $"{_currentTeamA} VS {_currentTeamB}";
-            Broadcast($"<size=20>MATCH STARTED: {vsText}</size>");
-            Broadcast($"MODE: {_currentRules.PresetName} on ARENA: {_activeArena.Name}");
-
-            CreateRustTeams();
-
-            foreach (var uid in _players)
+            bool hasActivePlayers = session.Players.Any(uid =>
             {
-                Team t = _playerTeams[uid];
+                var team = GetTeam(session, uid);
+                return (team == session.CurrentTeamA || team == session.CurrentTeamB) && BasePlayer.FindByID(uid) != null;
+            });
+            if (!hasActivePlayers)
+            {
+                ResetSessionState(session);
+                BroadcastToSession(session, "No players available to start.");
+                return;
+            }
+
+            session.State = GameState.Active;
+            session.AlivePlayers.Clear();
+            session.ArenaEntities.Clear();
+            session.TeamScores.Clear();
+            foreach(Team t in Enum.GetValues(typeof(Team))) session.TeamScores[t] = 0;
+
+            string vsText = (session.CurrentTeamB == Team.None) ? "PRACTICE MODE" : $"{session.CurrentTeamA} VS {session.CurrentTeamB}";
+            BroadcastToSession(session, $"<size=20>MATCH STARTED: {vsText}</size>");
+            BroadcastToSession(session, $"MODE: {session.Rules.PresetName} on ARENA: {session.Arena.Name}");
+
+            CreateRustTeams(session);
+
+            foreach (var uid in session.Players)
+            {
+                Team t = GetTeam(session, uid);
                 var p = BasePlayer.FindByID(uid);
                 if (p == null) continue;
+                CuiHelper.DestroyUi(p, LayerJoin);
                 CuiHelper.DestroyUi(p, LayerMenu);
 
-                if (t == _currentTeamA || t == _currentTeamB)
+                if (t == session.CurrentTeamA || t == session.CurrentTeamB)
                 {
-                    _alivePlayers.Add(uid);
-                    SetupPlayer(p, t, t == _currentTeamA);
+                    session.AlivePlayers.Add(uid);
+                    SetupPlayer(session, p, t, t == session.CurrentTeamA);
                 }
-                else MoveToSpectate(p);
+                else MoveToSpectate(session, p);
             }
 
-            _secondsRemaining = _config.GameDuration;
-            _gameTimer = timer.Repeat(1f, _secondsRemaining, () =>
+            session.SecondsRemaining = _config.GameDuration;
+            session.GameTimer = timer.Repeat(1f, session.SecondsRemaining, () =>
             {
-                _secondsRemaining--;
-                UpdateAllUI();
-                if (_secondsRemaining <= 0) EndGame("Time Limit");
+                session.SecondsRemaining--;
+                UpdateAllUI(session);
+                if (session.SecondsRemaining <= 0) EndGame(session, "Time Limit");
             });
         }
 
-        private void EndGame(string reason)
+        private void EndGame(MatchSession session, string reason)
         {
-            _gameTimer?.Destroy();
-            _currentState = GameState.Ending;
-            Broadcast($"<size=18>GAME OVER: {reason}</size>");
+            session.GameTimer?.Destroy();
+            session.State = GameState.Ending;
+            BroadcastToSession(session, $"<size=18>GAME OVER: {reason}</size>");
 
-            foreach (var ent in _arenaEntities) { if (ent != null && !ent.IsDestroyed) ent.Kill(); }
-            _arenaEntities.Clear();
+            foreach (var ent in session.ArenaEntities) { if (ent != null && !ent.IsDestroyed) ent.Kill(); }
+            session.ArenaEntities.Clear();
 
             timer.Once(5f, () =>
             {
-                foreach (var uid in _players.ToList())
+                foreach (var uid in session.Players.ToList())
                 {
                     var p = BasePlayer.FindByID(uid);
-                    if (p != null && _players.Contains(uid))
+                    if (p != null && session.Players.Contains(uid))
                     {
                         p.inventory.Strip();
                         if (_data.LobbySpawn != null) p.Teleport(_data.LobbySpawn.ToVector3());
                     }
                 }
-                CleanupRustTeams();
-                _currentTeamA = Team.None;
-                _currentTeamB = Team.None;
-                _alivePlayers.Clear();
-                _currentState = GameState.Lobby;
+                CleanupRustTeams(session);
+                session.CurrentTeamA = Team.None;
+                session.CurrentTeamB = Team.None;
+                session.AlivePlayers.Clear();
+                session.State = GameState.Lobby;
             });
         }
 
@@ -506,47 +651,47 @@ namespace Oxide.Plugins
 
         #region Player Actions
 
-        private void EliminatePlayer(BasePlayer attacker, BasePlayer victim)
+        private void EliminatePlayer(MatchSession session, BasePlayer attacker, BasePlayer victim)
         {
-            if (!_alivePlayers.Contains(victim.userID)) return;
+            if (!session.AlivePlayers.Contains(victim.userID)) return;
 
             Effect.server.Run("assets/bundled/prefabs/fx/player/flesh_hit.prefab", victim.transform.position);
             string attName = (attacker != null) ? attacker.displayName : "Arena";
-            Broadcast($"<color=orange>{victim.displayName}</color> ELIMINATED by {attName}!");
+            BroadcastToSession(session, $"<color=orange>{victim.displayName}</color> ELIMINATED by {attName}!");
 
-            _alivePlayers.Remove(victim.userID);
+            session.AlivePlayers.Remove(victim.userID);
 
             // MODE LOGIC
-            if (_currentRules.Mode == GameMode.TeamDeathmatch)
+            if (session.Rules.Mode == GameMode.TeamDeathmatch)
             {
                 if (attacker != null)
                 {
-                    Team aTeam = GetTeam(attacker.userID);
+                    Team aTeam = GetTeam(session, attacker.userID);
                     if (aTeam != Team.None)
                     {
-                        _teamScores[aTeam]++;
-                        if (_currentRules.ScoreLimit > 0 && _teamScores[aTeam] >= _currentRules.ScoreLimit)
+                        session.TeamScores[aTeam]++;
+                        if (session.Rules.ScoreLimit > 0 && session.TeamScores[aTeam] >= session.Rules.ScoreLimit)
                         {
-                            UpdateAllUI();
-                            EndGame($"TEAM {aTeam} WINS!");
+                            UpdateAllUI(session);
+                            EndGame(session, $"TEAM {aTeam} WINS!");
                             return;
                         }
                     }
                 }
-                UpdateAllUI();
+                UpdateAllUI(session);
 
                 if (victim.IsConnected)
                 {
                     SendReply(victim, "Respawning in 5s...");
                     timer.Once(5f, () => {
-                        if (_currentState == GameState.Active && _players.Contains(victim.userID))
+                        if (session.State == GameState.Active && session.Players.Contains(victim.userID))
                         {
                             var p = BasePlayer.FindByID(victim.userID);
                             if (p != null) {
-                                Team t = GetTeam(victim.userID);
+                                Team t = GetTeam(session, victim.userID);
                                 if (t != Team.None) {
-                                    _alivePlayers.Add(victim.userID);
-                                    SetupPlayer(p, t, t == _currentTeamA);
+                                    session.AlivePlayers.Add(victim.userID);
+                                    SetupPlayer(session, p, t, t == session.CurrentTeamA);
                                 }
                             }
                         }
@@ -555,31 +700,31 @@ namespace Oxide.Plugins
             }
             else // Elimination
             {
-                UpdateAllUI();
-                if (victim.IsConnected) MoveToSpectate(victim);
-                CheckWinCondition();
+                UpdateAllUI(session);
+                if (victim.IsConnected) MoveToSpectate(session, victim);
+                CheckWinCondition(session);
             }
         }
 
-        private void CheckWinCondition()
+        private void CheckWinCondition(MatchSession session)
         {
-            if (_currentState != GameState.Active || _currentRules.Mode == GameMode.TeamDeathmatch) return;
+            if (session.State != GameState.Active || session.Rules.Mode == GameMode.TeamDeathmatch) return;
 
-            int countA = _alivePlayers.Count(x => GetTeam(x) == _currentTeamA);
-            int countB = _alivePlayers.Count(x => GetTeam(x) == _currentTeamB);
+            int countA = session.AlivePlayers.Count(x => GetTeam(session, x) == session.CurrentTeamA);
+            int countB = session.AlivePlayers.Count(x => GetTeam(session, x) == session.CurrentTeamB);
 
-            if (_currentTeamB == Team.None) { if (countA == 0) EndGame("PRACTICE FINISHED"); return; }
+            if (session.CurrentTeamB == Team.None) { if (countA == 0) EndGame(session, "PRACTICE FINISHED"); return; }
 
-            if (countA == 0 && countB == 0) EndGame("DRAW!");
-            else if (countA == 0) EndGame($"TEAM {_currentTeamB} WINS!");
-            else if (countB == 0) EndGame($"TEAM {_currentTeamA} WINS!");
+            if (countA == 0 && countB == 0) EndGame(session, "DRAW!");
+            else if (countA == 0) EndGame(session, $"TEAM {session.CurrentTeamB} WINS!");
+            else if (countB == 0) EndGame(session, $"TEAM {session.CurrentTeamA} WINS!");
         }
 
-        private void SetupPlayer(BasePlayer player, Team team, bool isSideA)
+        private void SetupPlayer(MatchSession session, BasePlayer player, Team team, bool isSideA)
         {
-            AddToRustTeam(player, team);
+            AddToRustTeam(session, player, team);
             // Spawn Selection based on Active Arena
-            var spawns = isSideA ? _activeArena.SpawnsA : _activeArena.SpawnsB;
+            var spawns = isSideA ? session.Arena.SpawnsA : session.Arena.SpawnsB;
             if (spawns.Count == 0) spawns = new List<Vector3Data> { _data.LobbySpawn }; // Fallback
 
             if (spawns.Count > 0)
@@ -598,16 +743,16 @@ namespace Oxide.Plugins
             if (_allowMeds) player.inventory.GiveItem(ItemManager.CreateByName("syringe.medical", 3), player.inventory.containerBelt);
             if (_allowWalls) player.inventory.GiveItem(ItemManager.CreateByName("barricade.sandbags", 5), player.inventory.containerBelt);
 
-            UpdateHUD(player);
+            UpdateHUD(player, session);
             string msg = $"<size=20>TEAM: <color={GetTeamColorHex(team)}>{team}</color></size>";
             player.SendConsoleCommand("chat.add", 2, 0, msg);
         }
 
-        private void MoveToSpectate(BasePlayer player)
+        private void MoveToSpectate(MatchSession session, BasePlayer player)
         {
             player.inventory.Strip();
             if (_data.SpectateSpawn != null) player.Teleport(_data.SpectateSpawn.ToVector3());
-            UpdateHUD(player);
+            UpdateHUD(player, session);
         }
 
         #endregion
@@ -640,43 +785,117 @@ namespace Oxide.Plugins
             else player.Die();
         }
 
-        private void JoinGame(BasePlayer player)
+        private bool TryJoinSelected(BasePlayer player, bool openMenuIfMissing)
         {
-            if (_players.Contains(player.userID)) return;
-            if (_data.LobbySpawn == null) { SendReply(player, "Lobby not set."); return; }
+            var selection = GetPlayerSelection(player.userID);
+            if (string.IsNullOrEmpty(selection.ArenaName) || string.IsNullOrEmpty(selection.PresetKey))
+            {
+                if (openMenuIfMissing)
+                {
+                    SendReply(player, "Select arena and mode to join.");
+                    OpenJoinMenu(player);
+                }
+                return false;
+            }
+            var session = GetOrCreateSession(selection.ArenaName, selection.PresetKey);
+            if (session == null)
+            {
+                SendReply(player, "Selection invalid. Please re-select arena and mode.");
+                if (openMenuIfMissing) OpenJoinMenu(player);
+                return false;
+            }
+            var currentSession = GetPlayerSession(player.userID);
+            if (currentSession != null)
+            {
+                if (currentSession == session) { SendReply(player, "You are already in this match."); return false; }
+                SendReply(player, "Leave your current match before joining another.");
+                return false;
+            }
+            JoinGame(player, session);
+            return true;
+        }
+
+        private void ShowInfo(BasePlayer player)
+        {
+            string presetInfo = $"{PresetRuleTemplates[Preset5v5].PresetName}, {PresetRuleTemplates[Preset1v1].PresetName}, {PresetRuleTemplates[Preset2v2].PresetName}";
+            SendReply(player, "<color=#ffcc00>[PAINTBALL]</color> Updates:");
+            SendReply(player, $"• Multi-session matches per arena/preset ({presetInfo}) running together.");
+            SendReply(player, "• Ordered join flow: select arena → mode → join, then pick team in a colored lobby zone.");
+            SendReply(player, "• Session-based HUD, scoring, and team caps for clearer matches.");
+        }
+
+        private void JoinGame(BasePlayer player, MatchSession session)
+        {
+            if (session == null || GetPlayerSession(player.userID) != null) return;
+            if (_data.LobbySpawn == null) { SendReply(player, "Lobby spawn not configured. Contact an admin."); return; }
             SaveAndClearInventory(player);
-            _players.Add(player.userID);
-            _playerTeams[player.userID] = Team.None;
+            session.Players.Add(player.userID);
+            session.PlayerTeams[player.userID] = Team.None;
+            _playerSessions[player.userID] = session;
             player.Teleport(_data.LobbySpawn.ToVector3());
-            SendReply(player, "Welcome to the Arena!");
-            if (_players.Count >= _config.MinPlayers && _currentState == GameState.Lobby) StartLobbyCountdown();
+            SendReply(player, $"Joined {session.ArenaName} ({session.Rules.PresetName}). Walk to a colored lobby zone to choose your team.");
+            CuiHelper.DestroyUi(player, LayerJoin);
+            if (session.Players.Count >= _config.MinPlayers && session.State == GameState.Lobby) StartLobbyCountdown(session);
         }
 
         private void LeaveGame(BasePlayer player)
         {
-            if (!_players.Contains(player.userID)) return;
-            _players.Remove(player.userID);
-            _alivePlayers.Remove(player.userID);
-            _playerTeams.Remove(player.userID);
+            var session = GetPlayerSession(player.userID);
+            if (session == null) return;
+            session.Players.Remove(player.userID);
+            session.AlivePlayers.Remove(player.userID);
+            session.PlayerTeams.Remove(player.userID);
+            _playerSessions.Remove(player.userID);
             player.ClearTeam();
             CuiHelper.DestroyUi(player, LayerUI);
             CuiHelper.DestroyUi(player, LayerMenu);
+            CuiHelper.DestroyUi(player, LayerJoin);
             RestoreInventory(player);
             if (_data.ExitSpawn != null) player.Teleport(_data.ExitSpawn.ToVector3());
+            ResetSession(session);
         }
 
         private void CleanupGame()
         {
-            _gameTimer?.Destroy();
-            CleanupRustTeams();
-            foreach (var pId in _players)
+            foreach (var session in _sessions.Values.ToList())
             {
-                var p = BasePlayer.FindByID(pId);
-                if (p != null) RestoreInventory(p);
+                session.GameTimer?.Destroy();
+                CleanupRustTeams(session);
+                foreach (var ent in session.ArenaEntities) { if (ent != null && !ent.IsDestroyed) ent.Kill(); }
+                foreach (var pId in session.Players)
+                {
+                    var p = BasePlayer.FindByID(pId);
+                    if (p != null) RestoreInventory(p);
+                }
             }
+            _sessions.Clear();
+            _playerSessions.Clear();
         }
 
-        private Team GetTeam(ulong uid) => _playerTeams.ContainsKey(uid) ? _playerTeams[uid] : Team.None;
+        private void ResetSessionState(MatchSession session)
+        {
+            session.GameTimer?.Destroy();
+            CleanupRustTeams(session);
+            session.CurrentTeamA = Team.None;
+            session.CurrentTeamB = Team.None;
+            session.AlivePlayers.Clear();
+            session.TeamScores.Clear();
+            session.State = GameState.Lobby;
+            session.SecondsRemaining = 0;
+        }
+
+        private void ResetSession(MatchSession session)
+        {
+            if (session.Players.Count > 0) return;
+            foreach (var ent in session.ArenaEntities) { if (ent != null && !ent.IsDestroyed) ent.Kill(); }
+            session.ArenaEntities.Clear();
+            session.Players.Clear();
+            session.PlayerTeams.Clear();
+            ResetSessionState(session);
+            if (!string.IsNullOrEmpty(session.SessionKey)) _sessions.Remove(session.SessionKey);
+        }
+
+        private Team GetTeam(MatchSession session, ulong uid) => session.PlayerTeams.ContainsKey(uid) ? session.PlayerTeams[uid] : Team.None;
         private string GetTeamColorHex(Team t) {
             switch(t) {
                 case Team.Green: return "#55ff55"; case Team.Orange: return "#ffaa00";
@@ -685,18 +904,18 @@ namespace Oxide.Plugins
             }
         }
 
-        private void CreateRustTeams() {
-            _rustTeamIDs.Clear();
-            foreach(Team t in Enum.GetValues(typeof(Team))) { if (t != Team.None) _rustTeamIDs[t] = RelationshipManager.ServerInstance.CreateTeam().teamID; }
+        private void CreateRustTeams(MatchSession session) {
+            session.RustTeamIDs.Clear();
+            foreach(Team t in Enum.GetValues(typeof(Team))) { if (t != Team.None) session.RustTeamIDs[t] = RelationshipManager.ServerInstance.CreateTeam().teamID; }
         }
-        private void AddToRustTeam(BasePlayer p, Team t) {
-            if (!_rustTeamIDs.ContainsKey(t)) return;
+        private void AddToRustTeam(MatchSession session, BasePlayer p, Team t) {
+            if (!session.RustTeamIDs.ContainsKey(t)) return;
             if (p.currentTeam != 0) { RelationshipManager.ServerInstance.FindTeam(p.currentTeam)?.RemovePlayer(p.userID); p.currentTeam = 0; }
-            RelationshipManager.ServerInstance.FindTeam(_rustTeamIDs[t])?.AddPlayer(p);
+            RelationshipManager.ServerInstance.FindTeam(session.RustTeamIDs[t])?.AddPlayer(p);
         }
-        private void CleanupRustTeams() {
-            foreach(var id in _rustTeamIDs.Values) RelationshipManager.ServerInstance.DisbandTeam(RelationshipManager.ServerInstance.FindTeam(id));
-            _rustTeamIDs.Clear();
+        private void CleanupRustTeams(MatchSession session) {
+            foreach(var id in session.RustTeamIDs.Values) RelationshipManager.ServerInstance.DisbandTeam(RelationshipManager.ServerInstance.FindTeam(id));
+            session.RustTeamIDs.Clear();
         }
 
         #endregion
@@ -725,6 +944,7 @@ namespace Oxide.Plugins
                 AddHeader(e, p, "MATCH CONTROL", y); y -= 0.04f;
                 AddButtonRaw(e, p, "START MATCH", "pb_ui start", "0.2 0.6 0.2 0.9", Invariant($"0.05 {y-h}"), Invariant($"0.95 {y}")); y -= (h+g);
                 AddButtonRaw(e, p, "END GAME", "pb_ui stop", "0.7 0.2 0.2 0.9", Invariant($"0.05 {y-h}"), Invariant($"0.95 {y}")); y -= (h+g);
+                AddButtonRaw(e, p, "OPEN JOIN MENU", "pb_ui joinmenu", "0.2 0.4 0.7 0.9", Invariant($"0.05 {y-h}"), Invariant($"0.95 {y}")); y -= (h+g);
                 
                 y -= 0.02f; AddHeader(e, p, "GLOBAL", y); y -= 0.04f;
                 AddButtonRaw(e, p, $"MEDS: {(_allowMeds?"ON":"OFF")}", "pb_ui toggle_meds", _allowMeds?"0.2 0.6 0.2 0.9":"0.3 0.3 0.3 0.9", Invariant($"0.05 {y-h}"), Invariant($"0.48 {y}"));
@@ -749,9 +969,9 @@ namespace Oxide.Plugins
                 }
 
                 y -= 0.02f; AddHeader(e, p, $"ACTIVE RULES: {_currentRules.PresetName}", y); y -= 0.04f;
-                AddButtonRaw(e, p, "SET 5v5 TDM", "pb_ui set_mode 5v5", "0.2 0.2 0.5 0.9", Invariant($"0.05 {y-h}"), Invariant($"0.95 {y}")); y -= (h+g);
-                AddButtonRaw(e, p, "SET 1v1 DUEL", "pb_ui set_mode 1v1", "0.2 0.2 0.5 0.9", Invariant($"0.05 {y-h}"), Invariant($"0.95 {y}")); y -= (h+g);
-                AddButtonRaw(e, p, "SET 2v2 ELIM", "pb_ui set_mode 2v2", "0.2 0.2 0.5 0.9", Invariant($"0.05 {y-h}"), Invariant($"0.95 {y}"));
+                AddButtonRaw(e, p, "SET 5v5 TDM", $"pb_ui set_mode {Preset5v5}", "0.2 0.2 0.5 0.9", Invariant($"0.05 {y-h}"), Invariant($"0.95 {y}")); y -= (h+g);
+                AddButtonRaw(e, p, "SET 1v1 DUEL", $"pb_ui set_mode {Preset1v1}", "0.2 0.2 0.5 0.9", Invariant($"0.05 {y-h}"), Invariant($"0.95 {y}")); y -= (h+g);
+                AddButtonRaw(e, p, "SET 2v2 ELIM", $"pb_ui set_mode {Preset2v2}", "0.2 0.2 0.5 0.9", Invariant($"0.05 {y-h}"), Invariant($"0.95 {y}"));
             }
             else if (page == "setup")
             {
@@ -774,6 +994,44 @@ namespace Oxide.Plugins
             CuiHelper.AddUi(player, e);
         }
 
+        private void OpenJoinMenu(BasePlayer player)
+        {
+            var selection = GetPlayerSelection(player.userID);
+            CuiHelper.DestroyUi(player, LayerJoin);
+            var e = new CuiElementContainer();
+            var p = e.Add(new CuiPanel { Image = { Color = "0.12 0.12 0.12 0.98" }, RectTransform = { AnchorMin = "0.20 0.15", AnchorMax = "0.45 0.9" }, CursorEnabled = true }, "Overlay", LayerJoin);
+
+            e.Add(new CuiPanel { Image = { Color = "0.8 0.4 0 1" }, RectTransform = { AnchorMin = "0 0.92", AnchorMax = "1 1" } }, p);
+            e.Add(new CuiLabel { Text = { Text = "PAINTBALL JOIN", FontSize = 16, Align = TextAnchor.MiddleCenter, Font = "robotocondensed-bold.ttf" }, RectTransform = { AnchorMin = "0 0.92", AnchorMax = "1 1" } }, p);
+            e.Add(new CuiButton { Button = { Command = "pb_ui_join close", Color = "0.8 0.2 0.2 1" }, RectTransform = { AnchorMin = "0.85 0.93", AnchorMax = "0.98 0.99" }, Text = { Text = "X", Align = TextAnchor.MiddleCenter, Font = "robotocondensed-bold.ttf" } }, p);
+
+            float y = 0.88f, h = 0.05f, g = 0.01f;
+            AddHeader(e, p, "STEP 1: SELECT ARENA", y); y -= 0.04f;
+            if (_data?.Arenas != null)
+            {
+                foreach (var arena in _data.Arenas)
+                {
+                    string col = selection.ArenaName == arena.Name ? "0.3 0.8 0.3 0.9" : "0.3 0.3 0.3 0.9";
+                    AddButtonRaw(e, p, arena.Name, $"pb_ui_join arena \"{arena.Name}\"", col, Invariant($"0.05 {y-h}"), Invariant($"0.95 {y}")); y -= (h+g);
+                }
+            }
+
+            y -= 0.02f; AddHeader(e, p, "STEP 2: SELECT MODE", y); y -= 0.04f;
+            string preset = selection.PresetKey ?? Preset5v5;
+            AddButtonRaw(e, p, "5v5 TDM", $"pb_ui_join preset {Preset5v5}", preset == Preset5v5 ? "0.3 0.8 0.3 0.9" : "0.3 0.3 0.3 0.9", Invariant($"0.05 {y-h}"), Invariant($"0.95 {y}")); y -= (h+g);
+            AddButtonRaw(e, p, "1v1 DUEL", $"pb_ui_join preset {Preset1v1}", preset == Preset1v1 ? "0.3 0.8 0.3 0.9" : "0.3 0.3 0.3 0.9", Invariant($"0.05 {y-h}"), Invariant($"0.95 {y}")); y -= (h+g);
+            AddButtonRaw(e, p, "2v2 ELIM", $"pb_ui_join preset {Preset2v2}", preset == Preset2v2 ? "0.3 0.8 0.3 0.9" : "0.3 0.3 0.3 0.9", Invariant($"0.05 {y-h}"), Invariant($"0.95 {y}")); y -= (h+g);
+
+            y -= 0.02f; AddHeader(e, p, "STEP 3: JOIN", y); y -= 0.04f;
+            AddButtonRaw(e, p, "JOIN MATCH", "pb_ui_join join", "0.2 0.6 0.2 0.9", Invariant($"0.05 {y-h}"), Invariant($"0.95 {y}"));
+
+            string arenaName = selection.ArenaName ?? "Select Arena";
+            string presetName = GetPresetRules(preset).PresetName;
+            e.Add(new CuiLabel { Text = { Text = $"Selected: {arenaName} / {presetName}\nAfter clicking JOIN MATCH, walk to a colored lobby zone to choose your team.", FontSize = 11, Align = TextAnchor.MiddleCenter, Color = "0.8 0.8 0.8 1", Font = "robotocondensed-regular.ttf" }, RectTransform = { AnchorMin = "0.05 0.02", AnchorMax = "0.95 0.12" } }, p);
+
+            CuiHelper.AddUi(player, e);
+        }
+
         private void AddHeader(CuiElementContainer e, string p, string t, float y) {
             e.Add(new CuiLabel { Text = { Text = t, FontSize = 12, Align = TextAnchor.MiddleLeft, Color = "0.7 0.7 0.7 1", Font = "robotocondensed-regular.ttf" }, RectTransform = { AnchorMin = Invariant($"0.05 {y}"), AnchorMax = Invariant($"0.95 {y+0.03f}") } }, p);
         }
@@ -781,33 +1039,33 @@ namespace Oxide.Plugins
             e.Add(new CuiButton { Button = { Command = c, Color = col }, RectTransform = { AnchorMin = min, AnchorMax = max }, Text = { Text = t, Align = TextAnchor.MiddleCenter, FontSize = 11, Font = "robotocondensed-bold.ttf" } }, p);
         }
 
-        private void UpdateAllUI() { foreach (var uid in _players) { var p = BasePlayer.FindByID(uid); if (p != null) UpdateHUD(p); } }
+        private void UpdateAllUI(MatchSession session) { foreach (var uid in session.Players) { var p = BasePlayer.FindByID(uid); if (p != null) UpdateHUD(p, session); } }
 
-        private void UpdateHUD(BasePlayer player)
+        private void UpdateHUD(BasePlayer player, MatchSession session)
         {
             CuiHelper.DestroyUi(player, LayerUI);
-            if (_currentState != GameState.Active) return;
+            if (session.State != GameState.Active) return;
 
             var e = new CuiElementContainer();
             var p = e.Add(new CuiPanel { Image = { Color = "0.1 0.1 0.1 0.8" }, RectTransform = { AnchorMin = "0.70 0.88", AnchorMax = "0.99 0.98" }, CursorEnabled = false }, "Hud", LayerUI);
 
-            e.Add(new CuiLabel { Text = { Text = $"<size=14>PAINTBALL ({_currentRules.PresetName})</size>   <color=#cccccc>{TimeSpan.FromSeconds(_secondsRemaining):mm\\:ss}</color>", FontSize = 14, Align = TextAnchor.UpperCenter, Font = "robotocondensed-bold.ttf" }, RectTransform = { AnchorMin = "0 0.6", AnchorMax = "1 0.95" } }, p);
+            e.Add(new CuiLabel { Text = { Text = $"<size=14>PAINTBALL ({session.Rules.PresetName})</size>   <color=#cccccc>{TimeSpan.FromSeconds(session.SecondsRemaining):mm\\:ss}</color>", FontSize = 14, Align = TextAnchor.UpperCenter, Font = "robotocondensed-bold.ttf" }, RectTransform = { AnchorMin = "0 0.6", AnchorMax = "1 0.95" } }, p);
 
             string sc = "";
-            if (_currentRules.Mode == GameMode.TeamDeathmatch) {
-                int sA = _teamScores.ContainsKey(_currentTeamA) ? _teamScores[_currentTeamA] : 0;
-                int sB = _teamScores.ContainsKey(_currentTeamB) ? _teamScores[_currentTeamB] : 0;
-                sc = $"<color={GetTeamColorHex(_currentTeamA)}>{_currentTeamA}</color> {sA} vs {sB} <color={GetTeamColorHex(_currentTeamB)}>{_currentTeamB}</color>";
+            if (session.Rules.Mode == GameMode.TeamDeathmatch) {
+                int sA = session.TeamScores.ContainsKey(session.CurrentTeamA) ? session.TeamScores[session.CurrentTeamA] : 0;
+                int sB = session.TeamScores.ContainsKey(session.CurrentTeamB) ? session.TeamScores[session.CurrentTeamB] : 0;
+                sc = $"<color={GetTeamColorHex(session.CurrentTeamA)}>{session.CurrentTeamA}</color> {sA} vs {sB} <color={GetTeamColorHex(session.CurrentTeamB)}>{session.CurrentTeamB}</color>";
             } else {
-                int cA = _alivePlayers.Count(x => GetTeam(x) == _currentTeamA);
-                int cB = _alivePlayers.Count(x => GetTeam(x) == _currentTeamB);
-                sc = $"<color={GetTeamColorHex(_currentTeamA)}>{_currentTeamA}</color> {cA} vs {cB} <color={GetTeamColorHex(_currentTeamB)}>{_currentTeamB}</color>";
+                int cA = session.AlivePlayers.Count(x => GetTeam(session, x) == session.CurrentTeamA);
+                int cB = session.AlivePlayers.Count(x => GetTeam(session, x) == session.CurrentTeamB);
+                sc = $"<color={GetTeamColorHex(session.CurrentTeamA)}>{session.CurrentTeamA}</color> {cA} vs {cB} <color={GetTeamColorHex(session.CurrentTeamB)}>{session.CurrentTeamB}</color>";
             }
             e.Add(new CuiLabel { Text = { Text = sc, FontSize = 12, Align = TextAnchor.MiddleCenter, Font = "robotocondensed-bold.ttf" }, RectTransform = { AnchorMin = "0 0.25", AnchorMax = "1 0.6" } }, p);
             
-            bool isAlive = _alivePlayers.Contains(player.userID);
+            bool isAlive = session.AlivePlayers.Contains(player.userID);
             string st = isAlive ? "<color=#aaffaa>ALIVE</color>" : "<color=#ffaaaa>DEAD</color>";
-            if (!_playerTeams.ContainsKey(player.userID)) st = "SPECTATING";
+            if (!session.PlayerTeams.ContainsKey(player.userID)) st = "SPECTATING";
             e.Add(new CuiLabel { Text = { Text = st, FontSize = 10, Align = TextAnchor.LowerCenter, Font = "robotocondensed-regular.ttf" }, RectTransform = { AnchorMin = "0 0.05", AnchorMax = "1 0.25" } }, p);
 
             CuiHelper.AddUi(player, e);
@@ -824,9 +1082,22 @@ namespace Oxide.Plugins
             switch (cmd)
             {
                 case "close": CuiHelper.DestroyUi(p, LayerMenu); break;
-                case "start": StartMatch(true); OpenMenu(p, "game"); break; 
-                case "stop": EndGame("Admin Stopped"); OpenMenu(p, "game"); break;
+                case "start":
+                {
+                    var session = GetAdminViewSession();
+                    if (session != null) StartMatch(session, true);
+                    OpenMenu(p, "game");
+                    break;
+                }
+                case "stop":
+                {
+                    var session = GetAdminViewSession();
+                    if (session != null) EndGame(session, "Admin Stopped");
+                    OpenMenu(p, "game");
+                    break;
+                }
                 case "menu": OpenMenu(p, arg.GetString(1)); break;
+                case "joinmenu": OpenJoinMenu(p); break;
                 case "toggle_meds": _allowMeds = !_allowMeds; OpenMenu(p, "game"); break;
                 case "toggle_walls": _allowWalls = !_allowWalls; OpenMenu(p, "game"); break;
                 case "set_lobby": _data.LobbySpawn = new Vector3Data(p.transform.position); SaveData(); break;
@@ -842,14 +1113,14 @@ namespace Oxide.Plugins
                 
                 case "set_mode":
                     if(arg.HasArgs(2)) {
-                        string m = arg.GetString(1);
-                        if(m=="5v5") _currentRules = new MatchRules { PresetName="5v5 TDM", Mode=GameMode.TeamDeathmatch, ScoreLimit=10, TeamSize=5 };
-                        else if(m=="1v1") _currentRules = new MatchRules { PresetName="1v1 Duel", Mode=GameMode.TeamDeathmatch, ScoreLimit=3, TeamSize=1 };
-                        else if(m=="2v2") _currentRules = new MatchRules { PresetName="2v2 Elim", Mode=GameMode.Elimination, ScoreLimit=0, TeamSize=2 };
-                        
-                        // Clear teams if mode changes to prevent overflow
-                        _playerTeams.Clear(); _players.Clear();
-                        Broadcast($"Game Mode switched to {_currentRules.PresetName}. Teams Reset.");
+                        string m = arg.GetString(1).ToLower();
+                        if (!IsValidPresetKey(m))
+                        {
+                            SendReply(p, "Unknown preset key.");
+                            break;
+                        }
+                        _currentRules = GetPresetRules(m);
+                        SendReply(p, $"Admin view set to {_currentRules.PresetName}.");
                         OpenMenu(p, "modes");
                     } break;
 
@@ -872,11 +1143,54 @@ namespace Oxide.Plugins
             }
         }
 
+        [ConsoleCommand("pb_ui_join")]
+        private void CmdUIJoin(ConsoleSystem.Arg arg)
+        {
+            var p = arg.Connection?.player as BasePlayer;
+            if (p == null) return;
+            if (!arg.HasArgs(1)) { OpenJoinMenu(p); return; }
+
+            string cmd = arg.GetString(0);
+            var selection = GetPlayerSelection(p.userID);
+            switch (cmd)
+            {
+                case "close":
+                    CuiHelper.DestroyUi(p, LayerJoin);
+                    break;
+                case "open":
+                    OpenJoinMenu(p);
+                    break;
+                case "arena":
+                    if (arg.HasArgs(2)) { selection.ArenaName = arg.GetString(1); OpenJoinMenu(p); }
+                    break;
+                case "preset":
+                    if (arg.HasArgs(2)) { selection.PresetKey = arg.GetString(1); OpenJoinMenu(p); }
+                    break;
+                case "join":
+                    if (!TryJoinSelected(p, false)) OpenJoinMenu(p);
+                    break;
+            }
+        }
+
         [ChatCommand("pb")]
         private void CmdChat(BasePlayer player, string cmd, string[] args)
         {
             if (args.Length == 0) { if (permission.UserHasPermission(player.UserIDString, PermAdmin)) OpenMenu(player); else SendReply(player, "/pb join"); return; }
-            switch (args[0].ToLower()) { case "join": JoinGame(player); break; case "leave": LeaveGame(player); break; case "menu": if (permission.UserHasPermission(player.UserIDString, PermAdmin)) OpenMenu(player); break; }
+            switch (args[0].ToLower())
+            {
+                case "join":
+                    TryJoinSelected(player, true);
+                    break;
+                case "leave":
+                    LeaveGame(player);
+                    break;
+                case "menu":
+                    if (permission.UserHasPermission(player.UserIDString, PermAdmin)) OpenMenu(player);
+                    break;
+                case "info":
+                    ShowInfo(player);
+                    break;
+            }
         }
 
         #endregion
