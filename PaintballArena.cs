@@ -108,7 +108,7 @@ namespace Oxide.Plugins
 
         private class MatchRules
         {
-            // PresetKey should be one of: Preset5v5 ("5v5"), Preset1v1 ("1v1"), Preset2v2 ("2v2") - lowercase.
+            // PresetKey should use the preset constants (Preset5v5/Preset1v1/Preset2v2); their values are lowercase.
             public string PresetKey;
             public string PresetName;
             public GameMode Mode = GameMode.TeamDeathmatch;
@@ -288,7 +288,7 @@ namespace Oxide.Plugins
                 selection = new PlayerSelection();
                 _playerSelections[userId] = selection;
             }
-            if (!string.IsNullOrEmpty(selection.PresetKey)) selection.PresetKey = selection.PresetKey.ToLower();
+            selection.PresetKey = selection.PresetKey?.ToLower();
             if (string.IsNullOrEmpty(selection.PresetKey) || !IsValidPresetKey(selection.PresetKey)) selection.PresetKey = _currentRules?.PresetKey ?? Preset5v5;
             if (string.IsNullOrEmpty(selection.ArenaName) || (_data?.Arenas != null && _data.Arenas.All(a => a.Name != selection.ArenaName)))
             {
@@ -886,7 +886,6 @@ namespace Oxide.Plugins
             session.PlayerTeams.Clear();
             ResetSessionState(session);
             if (!string.IsNullOrEmpty(session.SessionKey)) _sessions.Remove(session.SessionKey);
-            else _sessions.Remove(GetSessionKey(session.ArenaName ?? string.Empty, session.PresetKey ?? string.Empty));
         }
 
         private Team GetTeam(MatchSession session, ulong uid) => session.PlayerTeams.ContainsKey(uid) ? session.PlayerTeams[uid] : Team.None;
